@@ -1,2 +1,2 @@
 # SAAS
-Cibersecurity application
+Cybersecurity application
