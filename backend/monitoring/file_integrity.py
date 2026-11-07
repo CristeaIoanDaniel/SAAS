@@ -1,62 +1,72 @@
-import socket
-import subprocess
-import time
-from collections import defaultdict
-from rysk_score import calculate_risk_score, get_local_network_info, get_public_ip_and_location
-connection_tracker = defaultdict(list)
-def kill_internet_connection(adapter_name="Wi-Fi"):
-    try:
-        cmd = f'netsh interface set interface "{adapter_name}" admin=DISABLED'
-        result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
-        if result.returncode == 0:
-            print(f"\n[SECURITY PROTOCOL ENGAGED] Network adapter '{adapter_name}' disabled. Internet severed.")
-            return True
-        return False
-    except Exception as e:
-        print(f"[ERROR] Kill-switch failed: {e}")
-        return False
-def evaluate_real_threats(attacker_ip):
-    current_time = time.time()
-    connection_tracker[attacker_ip] = [t for t in connection_tracker[attacker_ip] if current_time - t < 10]
-    connection_tracker[attacker_ip].append(current_time)
+import hashlib
+import json
+import os
+from pathlib import Path
+import config
+import security
+class FileIntegrityMonitor:
+    def __init__(self, roots=None, baseline_path=None, extensions=None, exclude=None):
+        self.roots = [Path(r) for r in (roots or config.WATCHED_PATHS)]
+        self.baseline_path = Path(baseline_path or config.FIM_BASELINE_PATH)
+        self.extensions = config.WATCH_EXTENSIONS if extensions is None else extensions
+        self.exclude = config.FIM_EXCLUDE_DIRS if exclude is None else exclude
 
-    is_port_scanning = len(connection_tracker[attacker_ip]) >= 5
-    assessment = calculate_risk_score(
-        ip=attacker_ip,
-        location="Unknown_External" if attacker_ip != "127.0.0.1" else "Brașov",
-        mac_address="AA:BB:CC:DD:EE:FF",
-        concurrent_logins=6 if is_port_scanning else 1,
-        file_integrity_modified=is_port_scanning
-    )
+    @staticmethod
+    def _sha256(path):
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+        except OSError:
+            return None
+        return h.hexdigest()
 
-    print(f"\n[!] Connection from IP: {attacker_ip} | Rapid Attempts: {len(connection_tracker[attacker_ip])}")
-    print(f"Risk Assessment: {assessment}")
+    def snapshot(self) -> dict:
+        result = {}
+        for root in self.roots:
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames if d not in self.exclude]
+                for name in filenames:
+                    p = Path(dirpath) / name
+                    if self.extensions and p.suffix.lower() not in self.extensions:
+                        continue
+                    digest = self._sha256(p)
+                    if digest:
+                        result[str(p)] = digest
+        return result
 
-    if assessment["risk_level"] == "SEVERE" or is_port_scanning:
-        print("[SEVERE THREAT DETECTED] Triggering automated defensive kill-switch...")
-        kill_internet_connection(adapter_name="Wi-Fi")
-        return True
-    return False
+    def build_baseline(self) -> int:
+        snap = self.snapshot()
+        self.baseline_path.write_text(json.dumps(snap, indent=1, sort_keys=True))
+        security.sign_file(self.baseline_path)
+        return len(snap)
 
-def start_real_defense_listener(host="0.0.0.0", port=9999):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((host, port))
-    server.listen(5)
-    print(f"[*] Real-World Defense Listener active on {host}:{port}")
+    def ensure_baseline(self):
+        if not self.baseline_path.exists():
+            n = self.build_baseline()
+            print(f"[+] FIM baseline created for {n} files.")
 
-    while True:
-        client_socket, addr = server.accept()
-        attacker_ip = addr[0]
+    def check(self) -> list:
+        """Returns a list of {'path','change'}; empty list = everything intact."""
+        if not self.baseline_path.exists():
+            self.build_baseline()
+            return []
+        if not security.verify_file(self.baseline_path):
+            return [{"path": str(self.baseline_path), "change": "baseline_tampered"}]
+        base = json.loads(self.baseline_path.read_text())
+        now = self.snapshot()
+        changes = []
+        for path, digest in now.items():
+            if path not in base:
+                changes.append({"path": path, "change": "created"})
+            elif base[path] != digest:
+                changes.append({"path": path, "change": "modified"})
+        for path in base:
+            if path not in now:
+                changes.append({"path": path, "change": "deleted"})
+        return changes
 
-        is_severe = evaluate_real_threats(attacker_ip)
-        if is_severe:
-            client_socket.send(b"Access Blocked: Intrusion Detected.\n")
-            client_socket.close()
-            break
-        else:
-            client_socket.send(b"Connection OK.\n")
-        client_socket.close()
 
-if __name__ == "__main__":
-    start_real_defense_listener()
+def check_file_integrity() -> bool:
+    return bool(FileIntegrityMonitor().check())

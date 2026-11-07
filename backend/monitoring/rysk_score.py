@@ -1,106 +1,51 @@
-import socket
-import urllib.request
-import json
-import uuid
+class RiskEngine:
+    ELEVATED, BLOCK, QUARANTINE = 40, 60, 90
 
-DEFAULT_IP = "0.0.0.0"
-DEFAULT_LOCATION = "Braila"
+    def __init__(self, ip_decay: float = 8, host_decay: float = 5):
+        self.ip_decay, self.host_decay = ip_decay, host_decay
+        self.ip_scores = {}
+        self.host_score = 0.0
 
-def get_local_network_info():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except Exception:
-        local_ip = "127.0.0.1"
-    mac_num = uuid.getnode()
-    mac_address = ':'.join(['{:02x}'.format((mac_num >> elements) & 0xff) for elements in range(5,-1,-1)])
+    def _action(self, score: float, multi_vector: bool) -> str:
+        if score >= self.QUARANTINE and multi_vector:
+            return "QUARANTINE"
+        if score >= self.BLOCK:
+            return "BLOCK_IP"
+        if score >= self.ELEVATED:
+            return "ELEVATED_SCAN"
+        return "PASS"
 
-    return local_ip, mac_address
+    def update(self, detections: list, fim_changes=None) -> dict:
+        seen = set()
+        for d in detections:
+            # base 15, up to +30 for ML severity, +25 per rule hit; capped per window
+            delta = min(70, 15 + 30 * d["severity"] + 25 * len(d["rule_hits"]))
+            self.ip_scores[d["src"]] = min(100, self.ip_scores.get(d["src"], 0) + delta)
+            seen.add(d["src"])
 
-def get_public_ip_and_location():
-    try:
-        url = "https://ipinfo.io/json"
-        with urllib.request.urlopen(url, timeout=3) as response:
-            data = json.loads(response.read().decode())
-            return data.get("ip", DEFAULT_IP), data.get("city", DEFAULT_LOCATION)
-    except Exception:
-        return DEFAULT_IP, DEFAULT_LOCATION
+        for ip in list(self.ip_scores):            # quiet sources cool down
+            if ip not in seen:
+                self.ip_scores[ip] -= self.ip_decay
+                if self.ip_scores[ip] <= 0:
+                    del self.ip_scores[ip]
 
-def calculate_risk_score(ip, location, mac_address, concurrent_logins=1, file_integrity_modified=False):
-    score = 0
-    factors = []
-    if ip in ["0.0.0.0", "0 0 0 0", "127.0.0.1"]:
-        score += 35
-        factors.append(f"Default/Loopback IP detected: {ip}")
-    elif ip.startswith("192.168.") or ip.startswith("10."):
-        score += 5
-        factors.append(f"Internal Network IP: {ip}")
-    else:
-        score += 25
-        factors.append(f"External/Public IP: {ip}")
-    if location.lower() == "braila":
-        score += 10
-        factors.append(f"Baseline Location: {location}")
-    else:
-        score += 35
-        factors.append(f"Unrecognized/Anomaly Location: {location}")
-    if not mac_address or mac_address in ["00:00:00:00:00:00", "0"]:
-        score += 20
-        factors.append("Missing or Null MAC Address")
-    else:
-        score += 5
-        factors.append(f"MAC Address Registered: {mac_address}")
-    if concurrent_logins > 3:
-        score += 30
-        factors.append(f"High Concurrent Logins: {concurrent_logins}")
-    elif concurrent_logins > 1:
-        score += 15
-        factors.append(f"Multiple Concurrent Logins: {concurrent_logins}")
-    else:
-        score += 0
-        factors.append("Single Login Session (Normal)")
+        if fim_changes is not None:
+            if fim_changes:
+                self.host_score = min(100, self.host_score + 60)
+            else:
+                self.host_score = max(0, self.host_score - self.host_decay)
 
-    # 5. File Integrity Evaluation
-    if file_integrity_modified:
-        score += 40
-        factors.append("File Integrity Breach: Unauthorized file modifications detected")
-    else:
-        score += 0
-        factors.append("File Integrity Intact")
+        per_ip = {}
+        for ip, s in self.ip_scores.items():
+            multi = ip in seen and self.host_score > 0
+            combined = min(100, s + (0.5 * self.host_score if multi else 0))
+            per_ip[ip] = {"score": round(combined, 1), "action": self._action(combined, multi)}
 
-    # Risk Level Classification
-    if score >= 75:
-        risk_level = "SEVERE"
-    elif score >= 45:
-        risk_level = "THREAT"
-    elif score >= 20:
-        risk_level = "WARNING"
-    else:
-        risk_level = "NORMAL"
-
-    return {
-        "risk_score": score,
-        "risk_level": risk_level,
-        "trigger_factors": factors
-    }
-
-if __name__ == "__main__":
-    print("--- Scanning Local Machine Network State ---")
-    live_ip, live_mac = get_local_network_info()
-    _, live_location = get_public_ip_and_location()
-
-    print(f"Detected IP: {live_ip}")
-    print(f"Detected Location: {live_location}")
-    print(f"Detected MAC Address: {live_mac}\n")
-
-    print("--- Running Live Risk Assessment ---")
-    live_test = calculate_risk_score(
-        ip=live_ip,
-        location=live_location,
-        mac_address=live_mac,
-        concurrent_logins=1,
-        file_integrity_modified=False
-    )
-    print(live_test)
+        order = ["PASS", "ELEVATED_SCAN", "BLOCK_IP", "QUARANTINE"]
+        overall_action = max((v["action"] for v in per_ip.values()),
+                             key=order.index, default="PASS")
+        overall = max([self.host_score] + [v["score"] for v in per_ip.values()])
+        if overall_action == "PASS" and self.host_score >= self.ELEVATED:
+            overall_action = "ELEVATED_SCAN"       # host-only breach: alert, no one to block
+        return {"overall": overall, "action": overall_action,
+                "host_score": self.host_score, "per_ip": per_ip}
