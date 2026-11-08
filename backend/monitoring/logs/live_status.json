@@ -1,0 +1,1 @@
+{"type": "window", "flagged": 0, "overall": 28, "host_score": 0, "action": "PASS", "threat_level": "LOW", "cut_level": "SEVERE", "per_ip": {"143.204.11.45": {"score": 28, "action": "PASS"}, "3.160.246.12": {"score": 14.9, "action": "PASS"}}, "network_cut": true, "simulated": false, "dry_run": false}

@@ -1,0 +1,7 @@
+# IDS runtime files (contain the signing key, trained models, logs)
+backend/monitoring/data/
+backend/monitoring/logs/
+__pycache__/
+*.pyc
+.venv/
+.idea/
