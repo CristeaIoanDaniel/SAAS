@@ -116,13 +116,13 @@ class AttackClassifier:
             raise ValueError("Need at least 20 attack AND 20 normal samples.")
         Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, stratify=y, random_state=42)
         check = RandomForestClassifier(n_estimators=200, class_weight="balanced",
-                                       random_state=42, n_jobs=-1).fit(Xtr, ytr)
+                                       random_state=42).fit(Xtr, ytr)
         print("[*] Accuracy on held-out data the model never saw during training:")
         print(classification_report(yte, check.predict(Xte),
                                     target_names=["normal", "attack"], digits=3))
         # final model uses ALL the data
         self.model = RandomForestClassifier(n_estimators=200, class_weight="balanced",
-                                            random_state=42, n_jobs=-1).fit(X, y)
+                                            random_state=42).fit(X, y)
 
     def proba(self, vec) -> float:
         return float(self.model.predict_proba([vec])[0][1])
@@ -141,6 +141,7 @@ class AttackClassifier:
             raise RuntimeError("Classifier was trained with different features - retrain.")
         c = cls()
         c.model = blob["model"]
+        c.model.set_params(n_jobs=1)
         return c
 
 # --------------------------------------------------------------------------
@@ -165,7 +166,7 @@ class NetworkIDS:
         # RobustScaler: a few huge values (downloads) won't squash everything else
         self.model = make_pipeline(
             RobustScaler(),
-            IsolationForest(n_estimators=300, contamination="auto", random_state=42, n_jobs=-1),
+            IsolationForest(n_estimators=300, contamination="auto", random_state=42),
         )
         self.model.fit(X)
         scores = self.model.score_samples(X)
@@ -211,8 +212,6 @@ class NetworkIDS:
                 "features": {k: round(float(v), 3) for k, v in feats.items()},
             })
         return detections
-
-    # --- persistence (signed, because joblib files are pickles) ---
     def save(self, path=config.MODEL_PATH):
         joblib.dump({"model": self.model, "threshold": self.threshold,
                      "features": FEATURE_NAMES, "sklearn": sklearn.__version__}, path)
@@ -231,17 +230,13 @@ class NetworkIDS:
             print(f"[!] Model built with scikit-learn {blob['sklearn']}, running {sklearn.__version__}")
         ids = cls()
         ids.model, ids.threshold = blob["model"], blob["threshold"]
+        ids.model.set_params(isolationforest__n_jobs=1)
         if config.CLASSIFIER_PATH.exists():
             ids.clf = AttackClassifier.load()
             print("[+] Supervised attack classifier loaded.")
         return ids
 
-
-# --------------------------------------------------------------------------
-# Packet sources
-# --------------------------------------------------------------------------
 class PacketCapture:
-    """Live capture with Scapy in a background thread (needs Npcap + Administrator)."""
     realtime = True
 
     def __init__(self, iface=None, bpf="ip", max_buffer=200_000):
@@ -286,8 +281,6 @@ class PacketCapture:
 
 
 class SimulatedSource:
-    """Synthetic traffic for testing without admin rights: 6 normal hosts, plus
-    a port scan and a SYN flood that appear every `attack_every` windows."""
     realtime = False
 
     def __init__(self, attacks=True, attack_every=12, seed=None):

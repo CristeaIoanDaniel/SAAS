@@ -1,12 +1,16 @@
-
 import ipaddress
 import subprocess
+
+import config
+
+
 class ResponseEngine:
     def __init__(self, dry_run: bool = True, whitelist=()):
         self.dry_run = dry_run
         self.whitelist = set(whitelist)
         self.blocked = set()
         self.quarantined = False
+        self.adapters_down = False
 
     def _run(self, cmd: list) -> bool:
         if self.dry_run:
@@ -52,4 +56,24 @@ class ResponseEngine:
                         "firewallpolicy", "blockinbound,allowoutbound"])
         if ok:
             self.quarantined = False
+        return ok
+
+    def kill_switch(self) -> bool:
+        ok = self.quarantine()
+        if config.HARD_CUT:
+            for n in config.NETWORK_ADAPTERS:
+                ok = self._run(["netsh", "interface", "set", "interface",
+                                f"name={n}", "admin=disabled"]) and ok
+            self.adapters_down = True
+        return ok
+
+    def restore_network(self) -> bool:
+        ok = True
+        for n in config.NETWORK_ADAPTERS:
+            ok = self._run(["netsh", "interface", "set", "interface",
+                            f"name={n}", "admin=enabled"]) and ok
+        self.adapters_down = False
+        ok = self._run(["netsh", "advfirewall", "set", "allprofiles",
+                        "firewallpolicy", "blockinbound,allowoutbound"]) and ok
+        self.quarantined = False
         return ok

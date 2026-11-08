@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>IDS dashboard</title>
+    <style>
+        body { font-family: sans-serif; max-width: 1000px; margin: 20px auto; background: #111; color: #eee; }
+        input, select, button { padding: 6px; margin: 2px; }
+        .panel { border: 1px solid #333; border-radius: 8px; padding: 12px; margin: 12px 0; }
+        .panel h3 { margin: 0 0 8px; }
+        .level { font-size: 1.3em; padding: 6px 10px; border-radius: 6px; background: #2a7; display: inline-block; }
+        .banner { display: none; background: #c22; padding: 10px; margin: 10px 0; font-weight: bold; }
+        .tag { font-size: .8em; padding: 2px 6px; border-radius: 4px; background: #345; margin-left: 6px; }
+        .danger { background: #b11; color: #fff; border: 0; font-weight: bold; padding: 8px 14px; cursor: pointer; }
+        .ok { background: #164; color: #fff; border: 0; padding: 8px 14px; cursor: pointer; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        td, th { border-bottom: 1px solid #333; padding: 4px; text-align: left; }
+    </style>
+</head>
+<body>
+<h2>IDS dashboard</h2>
+
+<div class="panel">
+    Cut level (auto-cut when the threat reaches it, applies to simulation and live)
+    <select id="cutLevel"></select>
+</div>
+
+<div class="panel">
+    <h3>Simulation <span class="tag">simulated traffic; real cut only if the box is ticked</span></h3>
+    Attacker IP <input id="ip" value="203.0.113.50">
+    <select id="type">
+        <option>port_scan</option><option>syn_flood</option>
+        <option>host_sweep</option><option>normal</option>
+    </select>
+    packets <input id="packets" type="number" value="150" style="width:70px">
+    windows <input id="windows" type="number" value="3" style="width:50px">
+    idle <input id="idle" type="number" value="2" style="width:50px">
+    <button id="go">Simulate attack</button>
+    <button id="simRestore">Reset simulation</button>
+    <label style="margin-left:10px"><input type="checkbox" id="realCut">
+        also cut my REAL internet if this reaches SEVERE</label>
+    <p>Threat: <span class="level" id="sim_level">LOW</span>
+        overall=<span id="sim_overall">0</span> host=<span id="sim_host">0</span></p>
+    <div class="banner" id="sim_banner">NETWORK CUT (simulated)</div>
+</div>
+
+<div class="panel">
+    <h3>Live IDS <span class="tag" id="live_state">waiting for IDS...</span></h3>
+    <p>Threat: <span class="level" id="live_level">LOW</span>
+        overall=<span id="live_overall">0</span> host=<span id="live_host">0</span>
+        <span class="tag" id="live_mode"></span></p>
+    <div class="banner" id="live_banner">NETWORK CUT</div>
+    <button class="danger" id="liveCut">Set SEVERE now: cut internet</button>
+    <button class="ok" id="liveRestore">Restore live network</button>
+    <p style="font-size:.9em;color:#aaa">Both buttons send a command to the running IDS
+        (<code>python ids_pipeline.py run</code>). If it runs without <code>--live-actions</code>
+        the cut is only printed as DRY-RUN.</p>
+</div>
+
+<table>
+    <thead><tr><th>Time</th><th>Source</th><th>Label</th><th>Severity</th><th>Risk</th><th>Action</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+</table>
+
+<script>
+    const $ = id => document.getElementById(id);
+    const colors = {LOW: "#2a7", ELEVATED: "#d90", HIGH: "#d50", SEVERE: "#c22"};
+    const post = (url, body) => fetch(url, {method: "POST", headers: {"Content-Type": "application/json"},
+                                            body: JSON.stringify(body || {})});
+    let lastLive = 0;
+
+    async function loadSettings() {
+      const s = await (await fetch("/api/settings")).json();
+      $("cutLevel").innerHTML = s.choices.map(c => `<option>${c}</option>`).join("");
+      $("cutLevel").value = s.cut_level;
+    }
+    $("cutLevel").onchange = e => post("/api/settings", {cut_level: e.target.value});
+
+    function liveRunning() { return Date.now() - lastLive < 15000; }
+
+    $("go").onclick = () => {
+      const real = $("realCut").checked;
+      if (real) {
+        if (!liveRunning()) { alert("The live IDS isn't running, so nothing can be cut. Start it first."); return; }
+        if (!confirm("If this simulation reaches SEVERE, your REAL internet will be cut " +
+                     "(when the IDS runs with --live-actions). Continue?")) return;
+      }
+      post("/api/simulate", {
+        type: $("type").value, src_ip: $("ip").value,
+        packets: +$("packets").value, windows: +$("windows").value, idle_windows: +$("idle").value,
+        real_cut: real
+      }).then(r => { if (!r.ok) r.json().then(j => alert(JSON.stringify(j.detail))); });
+    };
+    $("simRestore").onclick = () => post("/api/restore").then(() => { $("sim_banner").style.display = "none"; });
+
+    // ---- live control ----
+    $("liveCut").onclick = async () => {
+      if (!liveRunning()) { alert("The live IDS doesn't seem to be running. Start it first."); return; }
+      if (!confirm("This will CUT your real internet connection (if the IDS runs with --live-actions). Continue?")) return;
+      const r = await post("/api/live/cut", {confirm: true});
+      if (!r.ok) alert("Request failed: " + r.status);
+    };
+    $("liveRestore").onclick = async () => {
+      const r = await post("/api/live/restore", {confirm: true});
+      if (!r.ok) alert("Request failed: " + r.status);
+    };
+
+    setInterval(() => {
+      $("live_state").textContent = liveRunning() ? "IDS running" : "IDS not running";
+      $("live_state").style.background = liveRunning() ? "#164" : "#633";
+    }, 1000);
+
+    // ---- event stream ----
+    function applyWindow(p, e) {
+      $(p + "_overall").textContent = Math.round(e.overall);
+      $(p + "_host").textContent = Math.round(e.host_score);
+      const lv = $(p + "_level");
+      lv.textContent = e.threat_level || e.action;
+      lv.style.background = colors[e.threat_level] || "#2a7";
+      $(p + "_banner").style.display = e.network_cut ? "block" : "none";
+    }
+
+    const es = new EventSource("/api/stream");
+    es.onmessage = m => {
+      const e = JSON.parse(m.data);
+      const p = e.simulated ? "sim" : "live";
+      if (!e.simulated) lastLive = Date.now();
+      if (e.type === "window") {
+        applyWindow(p, e);
+        if (p === "live") $("live_mode").textContent = e.dry_run ? "DRY-RUN" : "LIVE ACTIONS";
+      } else if (e.type === "network_cut") {
+        $(p + "_banner").style.display = "block";
+      } else if (e.type === "network_restored") {
+        $(p + "_banner").style.display = "none";
+      } else if (e.type === "network_anomaly") {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td>${new Date(e.ts * 1000).toLocaleTimeString()}</td><td>${e.src}</td>` +
+                       `<td>${e.label}</td><td>${e.severity}</td><td>${e.risk}</td><td>${e.action}</td>` +
+                       `<td><span class="tag">${e.simulated ? "SIM" : "LIVE"}</span></td>`;
+        $("rows").prepend(tr);
+      }
+    };
+
+    loadSettings();
+</script>
+</body>
+</html>
